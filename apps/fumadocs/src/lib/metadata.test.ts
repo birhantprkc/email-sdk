@@ -137,6 +137,45 @@ describe("documentation structured data", () => {
   });
 });
 
+describe("machine-facing agent files", () => {
+  const providerNames = providers.map((provider) => provider.name);
+  const apiProviderCount = providers.filter((provider) => provider.key !== "smtp").length;
+
+  const machineFiles = {
+    "public/agents.md": readFileSync(new URL("../../public/agents.md", import.meta.url), "utf8"),
+    "public/.well-known/agent.json": readFileSync(
+      new URL("../../public/.well-known/agent.json", import.meta.url),
+      "utf8",
+    ),
+    "public/.well-known/agent-skills": readFileSync(
+      new URL("../../public/.well-known/agent-skills", import.meta.url),
+      "utf8",
+    ),
+    // llmsOverview is the same claim in the llms.txt source.
+    "src/lib/shared.ts": readFileSync(new URL("./shared.ts", import.meta.url), "utf8"),
+  };
+
+  test("report the current adapter count", () => {
+    const stale = Object.entries(machineFiles).filter(([, text]) => {
+      const counts = [...text.matchAll(/(\d+) provider API/g)].map((match) => Number(match[1]));
+
+      return counts.length === 0 || counts.some((count) => count !== apiProviderCount);
+    });
+
+    expect(stale.map(([file]) => file)).toEqual([]);
+  });
+
+  test("agents.md names every registered adapter in its supported list", () => {
+    // The guide wraps prose at ~70 columns, so the list can span lines.
+    const agentsMd = machineFiles["public/agents.md"].replace(/\s+/g, " ");
+    const list = agentsMd.match(/Supported providers: ([^.]+)\./)?.[1] ?? "";
+    const entries = list.split(/,|\band\b/).map((entry) => entry.trim());
+    const missing = providerNames.filter((name) => !entries.includes(name));
+
+    expect(missing).toEqual([]);
+  });
+});
+
 describe("supported provider structured data", () => {
   const providerNames = providers.map((provider) => provider.name);
 
