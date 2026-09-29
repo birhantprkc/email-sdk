@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,8 +13,13 @@ import {
   TELEMETRY_NOTICE,
   createTelemetry,
   detectCiVendor,
+  disableTelemetry,
+  getTelemetry,
+  getTelemetryStatus,
   isReportableSendError,
   normalizeAdapterName,
+  resetDisableTelemetry,
+  setTelemetryPreference,
 } from "./telemetry.js";
 import { stubFetch } from "../test-support/fetch.js";
 
@@ -96,6 +101,123 @@ describe("telemetry opt-out", () => {
     });
 
     expect(telemetry.enabled).toBe(false);
+  });
+});
+
+describe("telemetry preference", () => {
+  test("email-sdk telemetry disable persists across processes and keeps the identity", async () => {
+    const { calls, fetchFn } = fetchCapture();
+    const configDir = tempConfigDir();
+
+    createTelemetry({ env: {}, fetch: fetchFn, configDir, notify: () => {} });
+
+    // SAFETY: createTelemetry wrote this state file above with an installationId.
+    const before = JSON.parse(readFileSync(join(configDir, "telemetry.json"), "utf8")) as {
+      installationId: string;
+    };
+
+    setTelemetryPreference(false, { env: {}, configDir });
+
+    const telemetry = createTelemetry({ env: {}, fetch: fetchFn, configDir, notify: () => {} });
+    await telemetry.capture("cli command run", { command: "help" });
+
+    // SAFETY: setTelemetryPreference wrote this state file above.
+    const after = JSON.parse(readFileSync(join(configDir, "telemetry.json"), "utf8")) as {
+      installationId: string;
+      disabled: boolean;
+    };
+
+    expect(telemetry.enabled).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect(after).toMatchObject({ installationId: before.installationId, disabled: true });
+    expect(getTelemetryStatus({ env: {}, configDir })).toMatchObject({
+      enabled: false,
+      reason: "config",
+    });
+
+    setTelemetryPreference(true, { env: {}, configDir });
+    expect(getTelemetryStatus({ env: {}, configDir })).toMatchObject({
+      enabled: true,
+      reason: "default",
+    });
+  });
+
+  test("status names the environment variable that opted out", () => {
+    const configDir = tempConfigDir();
+
+    expect(getTelemetryStatus({ env: { DO_NOT_TRACK: "1" }, configDir }).reason).toBe(
+      "DO_NOT_TRACK",
+    );
+    expect(getTelemetryStatus({ env: { EMAIL_SDK_TELEMETRY: "off" }, configDir }).reason).toBe(
+      "EMAIL_SDK_TELEMETRY",
+    );
+  });
+
+  test("disableTelemetry() also silences instances that already exist", async () => {
+    const { calls, fetchFn } = fetchCapture();
+
+    const telemetry = createTelemetry({
+      env: {},
+      fetch: fetchFn,
+      configDir: tempConfigDir(),
+      notify: () => {},
+    });
+
+    try {
+      disableTelemetry();
+      await telemetry.capture("email sent", { adapter: "resend" });
+      expect(telemetry.enabled).toBe(false);
+      expect(calls).toHaveLength(0);
+    } finally {
+      resetDisableTelemetry();
+    }
+  });
+
+  test("an unreadable state file keeps telemetry off and is not overwritten", async () => {
+    const { calls, fetchFn } = fetchCapture();
+    const configDir = tempConfigDir();
+    const path = join(configDir, "telemetry.json");
+
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(path, '{"installationId": "abc", "disab');
+
+    const telemetry = createTelemetry({ env: {}, fetch: fetchFn, configDir, notify: () => {} });
+    await telemetry.capture("cli command run", { command: "help" });
+
+    expect(telemetry.enabled).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect(readFileSync(path, "utf8")).toBe('{"installationId": "abc", "disab');
+    expect(getTelemetryStatus({ env: {}, configDir }).reason).toBe("config-unreadable");
+
+    setTelemetryPreference(true, { env: {}, configDir });
+    expect(getTelemetryStatus({ env: {}, configDir }).enabled).toBe(true);
+  });
+
+  test("saving through a symlinked state file updates its target", () => {
+    const configDir = tempConfigDir();
+    const targetDir = tempConfigDir();
+    const target = join(targetDir, "shared-telemetry.json");
+
+    mkdirSync(configDir, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(target, '{"installationId": "shared", "noticeShown": true}');
+    symlinkSync(target, join(configDir, "telemetry.json"));
+
+    setTelemetryPreference(false, { env: {}, configDir });
+
+    expect(readFileSync(target, "utf8")).toContain('"disabled": true');
+    expect(getTelemetryStatus({ env: {}, configDir }).reason).toBe("config");
+    expect(readdirSync(configDir)).toEqual(["telemetry.json"]);
+  });
+
+  test("disableTelemetry() turns off the shared instance for the process", () => {
+    try {
+      disableTelemetry();
+      expect(getTelemetry().enabled).toBe(false);
+      expect(getTelemetryStatus({ env: {}, configDir: tempConfigDir() }).reason).toBe("code");
+    } finally {
+      resetDisableTelemetry();
+    }
   });
 });
 
